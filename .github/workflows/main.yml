@@ -2,12 +2,14 @@ name: CC Radio Auto Recorder
 
 on:
   schedule:
-    - cron: '45 18 * * *' # รันตี 1:45 ทุกวัน (เวลาไทย)
+    - cron: '30 13 * * *' # เริ่มรัน 20:30 น. ทุกวัน (เวลาไทย / 13:30 UTC)
   workflow_dispatch:
 
 jobs:
   record_and_upload:
     runs-on: ubuntu-latest
+    # แนะนำให้เพิ่ม timeout เผื่อสคริปต์ค้าง (210 นาที + เวลาเผื่ออัปโหลด 15 นาที)
+    timeout-minutes: 225 
 
     steps:
       - name: Checkout Repository
@@ -30,7 +32,7 @@ jobs:
           pip install --upgrade pip
           pip install google-genai edge-tts
 
-      # 🎙️ รันโปรแกรมบันทึกเสียง
+      # 🎙️ รันโปรแกรมบันทึกเสียง (ต้องตั้งให้หยุดอัดเมื่อครบ 210 นาทีในไฟล์นี้)
       - name: Run Recorder Script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
