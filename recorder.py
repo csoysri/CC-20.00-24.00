@@ -10,9 +10,9 @@ from google import genai
 
 TARGET_URL = "https://cdn-fr1-eu.lncoperations.ee/hls/cnbc_live/index.m3u8" 
 
-# 🛠️ ตั้งเวลาทดสอบ: อัด 30 วินาที / ตัดท่อนละ 15 วินาที
-RECORD_DURATION = 10800  
-SEGMENT_DURATION = 420  
+# 🛠️ ตั้งเวลา: อัด 3 ชั่วโมง 30 นาที (12600 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
+RECORD_DURATION = 12600  
+SEGMENT_DURATION = 420
 
 # 🔑 ดึง Key จาก GitHub Secret อัตโนมัติ
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
