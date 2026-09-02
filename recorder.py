@@ -50,10 +50,12 @@ def record_stream(output_filename, duration):
 
     return os.path.exists(output_filename) and os.path.getsize(output_filename) > 0
 
-def split_audio(input_file, date_prefix, segment_time=15):
+def split_audio(input_file, date_prefix, folder_name, segment_time=15):
     """ตัดแบ่งไฟล์เสียง .mp3"""
     print(f"\n✂️ กำลังตัดแบ่งไฟล์ '{input_file}' เป็นท่อนละ {segment_time} วินาที...")
-    output_pattern = f"./{date_prefix}_part_%03d.mp3"
+    
+    # กำหนด path ให้อยู่ในโฟลเดอร์ที่สร้างขึ้น
+    output_pattern = os.path.join(folder_name, f"{date_prefix}_part_%03d.mp3")
 
     cmd = [
         'ffmpeg', '-y',
@@ -64,7 +66,9 @@ def split_audio(input_file, date_prefix, segment_time=15):
         output_pattern
     ]
     subprocess.run(cmd, check=True)
-    segments = sorted(glob.glob(f"./{date_prefix}_part_*.mp3"))
+    
+    # ค้นหาไฟล์ที่ถูกตัดในโฟลเดอร์
+    segments = sorted(glob.glob(os.path.join(folder_name, f"{date_prefix}_part_*.mp3")))
     print(f"🎉 ตัดไฟล์สำเร็จ! ได้ทั้งหมด {len(segments)} ไฟล์\n")
     return segments
 
@@ -126,6 +130,7 @@ def process_single_file(seg_path, current_idx, total_files):
     if not th_text:
         return None
 
+    # .replace จะยังคงทำให้ path อยู่ในโฟลเดอร์เดียวกับ seg_path อัตโนมัติ
     txt_filename = seg_path.replace(".mp3", "_แปลไทย.txt")
     with open(txt_filename, "w", encoding="utf-8") as f:
         f.write(th_text)
@@ -137,15 +142,16 @@ def process_single_file(seg_path, current_idx, total_files):
     
     return tts_filename
 
-def merge_and_cleanup_tts(tts_files, output_filename):
+def merge_and_cleanup_tts(tts_files, output_filename, folder_name):
     """นำไฟล์เสียงอ่านข่าวทั้งหมดมารวมกันเป็นไฟล์เดียว แล้วลบไฟล์ย่อยทิ้ง"""
     print(f"==================================================")
     print(f"🔗 กำลังรวมไฟล์เสียงอ่านข่าวทั้งหมด {len(tts_files)} ไฟล์...")
     
-    list_file = "tts_concat_list.txt"
+    list_file = os.path.join(folder_name, "tts_concat_list.txt")
     with open(list_file, "w", encoding="utf-8") as f:
         for tts in tts_files:
-            f.write(f"file '{tts}'\n")
+            # ใช้ abspath เพื่อป้องกันปัญหา path ใน ffmpeg
+            f.write(f"file '{os.path.abspath(tts)}'\n")
 
     cmd = [
         'ffmpeg', '-y',
@@ -175,13 +181,27 @@ def merge_and_cleanup_tts(tts_files, output_filename):
 if __name__ == "__main__":
     th_time = datetime.now(ZoneInfo("Asia/Bangkok"))
     date_str = th_time.strftime('%Y%m%d_%H%M%S')
-    main_file = f"./raw_cnbc_{date_str}.mp3"
+    
+    # 📁 1. ดึงชื่อไฟล์ yml จาก Github Actions (หากไม่มีจะใช้ค่า Default เป็น "CNBC_Workflow")
+    yml_name = os.getenv("GITHUB_WORKFLOW", "CNBC_Workflow")
+    yml_name = yml_name.replace(" ", "_") # จัดการช่องว่างเพื่อความปลอดภัยของชื่อโฟลเดอร์
+    
+    # 📁 2. นำชื่อ yml มาต่อด้วย เวลา-นาที (HH-MM)
+    folder_time = th_time.strftime('%H-%M') 
+    folder_name = f"{yml_name}_{folder_time}"
+    
+    # 📁 3. สร้างโฟลเดอร์
+    os.makedirs(folder_name, exist_ok=True)
+    print(f"📁 สร้างโฟลเดอร์สำหรับเก็บผลลัพธ์: {folder_name}\n")
+
+    # กำหนด Path ให้ไฟล์หลักไปอยู่ในโฟลเดอร์ที่สร้างขึ้น
+    main_file = os.path.join(folder_name, f"raw_cnbc_{date_str}.mp3")
 
     success = record_stream(main_file, RECORD_DURATION)
 
     if success:
         print(f"✅ บันทึกไฟล์หลักสำเร็จ: {main_file}")
-        segment_files = split_audio(main_file, date_str, SEGMENT_DURATION)
+        segment_files = split_audio(main_file, date_str, folder_name, SEGMENT_DURATION)
         total_segments = len(segment_files)
         
         # เก็บรายชื่อไฟล์เสียงอ่านข่าวเพื่อนำไปรวม
@@ -197,8 +217,8 @@ if __name__ == "__main__":
         
         # ดำเนินการรวมไฟล์เสียงอ่านข่าวทั้งหมดและลบไฟล์ย่อย
         if generated_tts_files:
-            final_audio = f"./final_thai_news_{date_str}.mp3"
-            merge_and_cleanup_tts(generated_tts_files, final_audio)
+            final_audio = os.path.join(folder_name, f"final_thai_news_{date_str}.mp3")
+            merge_and_cleanup_tts(generated_tts_files, final_audio, folder_name)
             
     else:
         print("❌ การบันทึกเสียงล้มเหลว")
