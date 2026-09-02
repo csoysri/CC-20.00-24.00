@@ -2,7 +2,7 @@ name: CC 20.00-24.00 Radio Auto Recorder
 
 on:
   schedule:
-    - cron: '00 08 * * *' # ห่าง 12 ชม.เริ่มรัน 20:00 น. ทุกวัน (เวลาไทย / 13:30 UTC)
+    - cron: '00 09 * * *' # ห่าง 13 ชม.เริ่มรัน 20:00 น. ทุกวัน (เวลาไทย / 13:30 UTC)
   workflow_dispatch:
 
 jobs:
