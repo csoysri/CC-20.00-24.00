@@ -10,7 +10,7 @@ from google import genai
 
 TARGET_URL = "https://cdn-fr1-eu.lncoperations.ee/hls/cnbc_live/index.m3u8" 
 
-# 🛠️ ตั้งเวลา: อัด 3 ชั่วโมง 30 นาที (12600 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
+# 🛠️ ตั้งเวลา: อัด 3 ชั่วโมง (10800 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
 RECORD_DURATION = 10800  
 SEGMENT_DURATION = 420
 
@@ -50,30 +50,30 @@ def record_stream(output_filename, duration):
 
     return os.path.exists(output_filename) and os.path.getsize(output_filename) > 0
 
-def split_audio(input_file, date_prefix, folder_name, segment_time=15):
-    """ตัดแบ่งไฟล์เสียง .mp3"""
+def split_audio(input_file, date_prefix, folder_name, segment_time=420):
+    """ตัดแบ่งไฟล์เสียง .mp3 พร้อมจัดเรียง timestamp รอยต่อให้สะอาด"""
     print(f"\n✂️ กำลังตัดแบ่งไฟล์ '{input_file}' เป็นท่อนละ {segment_time} วินาที...")
     
-    # กำหนด path ให้อยู่ในโฟลเดอร์ที่สร้างขึ้น
     output_pattern = os.path.join(folder_name, f"{date_prefix}_part_%03d.mp3")
 
+    # เพิ่ม -avoid_negative_ts make_zero เพื่อป้องกันปัญหา Timestamp ติดลบ/สะดุดรอยต่อ
     cmd = [
         'ffmpeg', '-y',
         '-i', input_file,
         '-f', 'segment',
         '-segment_time', str(segment_time),
+        '-avoid_negative_ts', 'make_zero',
         '-c', 'copy',
         output_pattern
     ]
     subprocess.run(cmd, check=True)
     
-    # ค้นหาไฟล์ที่ถูกตัดในโฟลเดอร์
     segments = sorted(glob.glob(os.path.join(folder_name, f"{date_prefix}_part_*.mp3")))
     print(f"🎉 ตัดไฟล์สำเร็จ! ได้ทั้งหมด {len(segments)} ไฟล์\n")
     return segments
 
 def transcribe_and_translate(audio_path, max_retries=3):
-    """ส่งไฟล์เสียงไปแปลไทยด้วย Gemini"""
+    """ส่งไฟล์เสียงไปแปลไทยด้วย Gemini พร้อมควบคุมอาการหลอน/พูดซ้ำ"""
     if not client:
         print("  ⚠️ ไม่พบ GEMINI_API_KEY ข้ามการแปลภาษา")
         return None
@@ -92,16 +92,23 @@ def transcribe_and_translate(audio_path, max_retries=3):
             4. แปลถ่ายทอดเนื้อหาคำพูดและบทวิเคราะห์ให้ครบถ้วนทุกประโยคตั้งแต่ต้นจนจบ
             5. ไม่ต้องใส่ตัวเลขเวลา (Timestamp)
             6. ให้ส่งออกเฉพาะข้อความภาษาไทยที่อ่านได้อย่างต่อเนื่อง สละสลวย เท่านั้น
-            7. ลบภาษาอังกฤษออก
+            7. กฎเหล็กป้องกันอาการวนลูป: หากไฟล์เสียงช่วงใดมีเฉพาะเสียงดนตรี ดนตรีคั่นรายการ หรือเป็นความเงียบโดยไม่มีเสียงคนพูด ให้ข้ามไป ห้ามแต่งเรื่อง ห้ามเดาข้อความ และห้ามทวนประโยคเดิมซ้ำโดยเด็ดขาด
+            8. หากทั้งไฟล์ไม่มีเสียงพูดเลย ให้ตอบกลับมาเพียงสั้นๆ ว่า "ไม่มีเสียงบรรยายข่าว"
             """
 
             response = client.models.generate_content(
-                model='gemini-3.5-flash-lite',
+                model='gemini-2.5-flash',
                 contents=[audio_file, prompt]
             )
 
             client.files.delete(name=audio_file.name)
-            return response.text
+            text_result = response.text.strip() if response.text else ""
+            
+            # กรองท่อนที่ไม่มีเสียงพูดออก ไม่ต้องส่งไปสังเคราะห์เสียงอ่าน
+            if "ไม่มีเสียงบรรยายข่าว" in text_result:
+                return None
+                
+            return text_result
 
         except Exception as e:
             print(f"  ⚠️ ครั้งที่ {attempt} พบปัญหา ({e})")
@@ -128,9 +135,9 @@ def process_single_file(seg_path, current_idx, total_files):
 
     th_text = transcribe_and_translate(seg_path)
     if not th_text:
+        print(f"  ⏭️ ข้ามการสร้างเสียงสำหรับไฟล์ {os.path.basename(seg_path)} (ไม่มีเสียงพูดหรือแปลไม่สำเร็จ)")
         return None
 
-    # .replace จะยังคงทำให้ path อยู่ในโฟลเดอร์เดียวกับ seg_path อัตโนมัติ
     txt_filename = seg_path.replace(".mp3", "_แปลไทย.txt")
     with open(txt_filename, "w", encoding="utf-8") as f:
         f.write(th_text)
@@ -143,32 +150,51 @@ def process_single_file(seg_path, current_idx, total_files):
     return tts_filename
 
 def merge_and_cleanup_tts(tts_files, output_filename, folder_name):
-    """นำไฟล์เสียงอ่านข่าวทั้งหมดมารวมกันเป็นไฟล์เดียว แล้วลบไฟล์ย่อยทิ้ง"""
+    """
+    รวมไฟล์เสียงอ่านข่าวทั้งหมดด้วย Filter Complex Concat
+    แก้ปัญหาเวลาเพี้ยน และเสียงวนซ้ำตรงรอยต่อไฟล์อย่างสมบูรณ์
+    """
     print(f"==================================================")
-    print(f"🔗 กำลังรวมไฟล์เสียงอ่านข่าวทั้งหมด {len(tts_files)} ไฟล์...")
-    
-    list_file = os.path.join(folder_name, "tts_concat_list.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for tts in tts_files:
-            # ใช้ abspath เพื่อป้องกันปัญหา path ใน ffmpeg
-            f.write(f"file '{os.path.abspath(tts)}'\n")
+    print(f"🔗 กำลังรวมไฟล์เสียงอ่านข่าวทั้งหมด {len(tts_files)} ไฟล์ (ระบบไร้รอยต่อ)...")
 
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', list_file,
-        '-c', 'copy',
+    if not tts_files:
+        print("⚠️ ไม่มีไฟล์เสียงสำหรับรวม")
+        return
+
+    # กรณีมีไฟล์เดียว ให้ย้าย/เปลี่ยนชื่อได้ทันที
+    if len(tts_files) == 1:
+        shutil.move(tts_files[0], output_filename)
+        print(f"✅ มีเพียงไฟล์เดียว บันทึกสำเร็จ: {output_filename}")
+        return
+
+    cmd = ['ffmpeg', '-y']
+
+    # 1. ป้อน input เข้าทีละไฟล์
+    for f in tts_files:
+        cmd.extend(['-i', os.path.abspath(f)])
+
+    # 2. ผูก Filter Concat เข้าด้วยกัน (Decode เป็น PCM ก่อนต่อ)
+    n = len(tts_files)
+    filter_inputs = "".join([f"[{i}:a]" for i in range(n)])
+    filter_str = f"{filter_inputs}concat=n={n}:v=0:a=1[outa]"
+
+    cmd.extend([
+        '-filter_complex', filter_str,
+        '-map', '[outa]',
+        '-c:a', 'libmp3lame',
+        '-b:a', '128k',
+        '-ar', '44100',          # บังคับ Sample Rate เท่ากัน ป้องกันเวลาเพี้ยน
+        '-ac', '2',              # บังคับ Stereo เท่ากันทุกไฟล์
+        '-map_metadata', '-1',   # ลบ Metadata เก่าที่ฝังตรงรอยต่อของแต่ละพาร์ท
         output_filename
-    ]
+    ])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode == 0 and os.path.exists(output_filename):
-        print(f"✅ รวมไฟล์เสียงสำเร็จ: {output_filename}")
+        print(f"✅ รวมไฟล์เสียงสำเร็จสมบูรณ์: {output_filename}")
         
-        # ลบไฟล์รายการและไฟล์เสียงย่อย
-        os.remove(list_file)
+        # ลบเฉพาะไฟล์ย่อยที่นำมารวมแล้ว
         for tts in tts_files:
             try:
                 os.remove(tts)
@@ -184,7 +210,7 @@ if __name__ == "__main__":
     
     # 📁 1. ดึงชื่อไฟล์ yml จาก Github Actions (หากไม่มีจะใช้ค่า Default เป็น "CNBC_Workflow")
     yml_name = os.getenv("GITHUB_WORKFLOW", "CNBC_Workflow")
-    yml_name = yml_name.replace(" ", "_") # จัดการช่องว่างเพื่อความปลอดภัยของชื่อโฟลเดอร์
+    yml_name = yml_name.replace(" ", "_")
     
     # 📁 2. นำชื่อ yml มาต่อด้วย เวลา-นาที (HH-MM)
     folder_time = th_time.strftime('%H-%M') 
@@ -194,7 +220,6 @@ if __name__ == "__main__":
     os.makedirs(folder_name, exist_ok=True)
     print(f"📁 สร้างโฟลเดอร์สำหรับเก็บผลลัพธ์: {folder_name}\n")
 
-    # กำหนด Path ให้ไฟล์หลักไปอยู่ในโฟลเดอร์ที่สร้างขึ้น
     main_file = os.path.join(folder_name, f"raw_cnbc_{date_str}.mp3")
 
     success = record_stream(main_file, RECORD_DURATION)
@@ -204,7 +229,6 @@ if __name__ == "__main__":
         segment_files = split_audio(main_file, date_str, folder_name, SEGMENT_DURATION)
         total_segments = len(segment_files)
         
-        # เก็บรายชื่อไฟล์เสียงอ่านข่าวเพื่อนำไปรวม
         generated_tts_files = []
 
         for idx, seg in enumerate(segment_files, start=1):
