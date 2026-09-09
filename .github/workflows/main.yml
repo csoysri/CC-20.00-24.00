@@ -2,7 +2,7 @@ name: CC 20.00-24.00
 
 on:
   schedule:
-    - cron: '00 08 * * *' # ห่าง  ชม.เริ่มรัน 20:00 น. ทุกวัน (เวลาไทย / 13:30 UTC)
+    - cron: '00 08 * * *' # เริ่มรัน 20:00 น. ทุกวัน (เวลาไทย / 13:30 UTC)
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 🎬 ติดตั้ง FFmpeg สำหรับอัดและแปลงเสียง
+      # 🎬 ติดตั้ง FFmpeg สำหรับอัด แปลง และรวมเสียง
       - name: Install FFmpeg
         run: |
           sudo apt-get update
@@ -39,6 +39,37 @@ jobs:
         run: |
           python recorder.py
 
+      # 🔗 ตรวจสอบและรวมไฟล์ MP3 ให้เป็นไฟล์เดียว (หากมีการตัดแบ่งไฟล์มา)
+      - name: Merge MP3 files
+        run: |
+          mp3_count=$(ls -1 *.mp3 2>/dev/null | wc -l)
+          
+          if [ "$mp3_count" -gt 1 ]; then
+            echo "=== พบไฟล์ MP3 จำนวน $mp3_count ไฟล์ เริ่มทำการรวมเป็นไฟล์เดียว ==="
+            
+            # สร้าง list ชื่อไฟล์ เรียงตามตัวเลขและตัวอักษร (-v) เพื่อให้ ffmpeg อ่าน
+            ls -v *.mp3 | while read -r file; do echo "file '$file'" >> mp3_list.txt; done
+            
+            # กำหนดชื่อไฟล์รวม
+            OUTPUT_NAME="Combined_CC_20.00-24.00_$(TZ='Asia/Bangkok' date +'%Y-%m-%d').mp3"
+            
+            # รวมไฟล์เข้าด้วยกันโดยไม่ลดคุณภาพ (copy stream)
+            ffmpeg -f concat -safe 0 -i mp3_list.txt -c copy "$OUTPUT_NAME"
+            
+            # ย้ายไฟล์ย่อย (Chunks) ทั้งหมดไปเก็บในโฟลเดอร์ raw_chunks เพื่อไม่ให้รบกวนตอนอัปโหลด
+            mkdir -p raw_chunks
+            mv *.mp3 raw_chunks/ 2>/dev/null || true
+            
+            # ย้ายไฟล์รวมที่สำเร็จแล้วกลับมาเตรียมอัปโหลดเพียงไฟล์เดียว
+            mv "raw_chunks/$OUTPUT_NAME" ./
+            
+            echo "=== รวมไฟล์เสร็จสิ้น ได้ไฟล์: $OUTPUT_NAME ==="
+          elif [ "$mp3_count" -eq 1 ]; then
+            echo "=== มีไฟล์ MP3 เพียงไฟล์เดียว ไม่จำเป็นต้องรวมไฟล์ ==="
+          else
+            echo "=== ไม่พบไฟล์ MP3 สำหรับอัปโหลด ==="
+          fi
+
       # ☁️ ติดตั้ง Rclone
       - name: Install Rclone
         run: |
@@ -52,8 +83,10 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF_DATA" > ~/.config/rclone/rclone.conf
           
-          TARGET_FOLDER="CNBC/$(TZ='Asia/Bangkok' date +'%Y-%m-%d')"
+          # เปลี่ยน Path สร้างโฟลเดอร์ CC 20.00-24.00 ภายใต้ CNBC 
+          TARGET_FOLDER="CNBC/CC 20.00-24.00/$(TZ='Asia/Bangkok' date +'%Y-%m-%d')"
           
-          echo "=== กำลังย้ายไฟล์ทั้งหมดเข้าโฟลเดอร์: $TARGET_FOLDER ==="
+          echo "=== กำลังอัปโหลดไฟล์เข้าโฟลเดอร์: $TARGET_FOLDER ==="
           
-          rclone move ./ "mydrive:$TARGET_FOLDER" --include "*.mp3" --include "*.txt" --verbose
+          # ใช้ copy แทน move เพื่อความปลอดภัยของไฟล์ และป้องกัน Error หากเซิร์ฟเวอร์สะดุดตอนลบไฟล์ทิ้ง
+          rclone copy ./ "mydrive:$TARGET_FOLDER" --include "*.mp3" --include "*.txt" --verbose
