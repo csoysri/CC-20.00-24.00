@@ -120,16 +120,106 @@ def transcribe_and_translate(audio_path, max_retries=3):
             else:
                 return None
 
-async def text_to_speech_thai(text, output_audio_path):
-    """สร้างไฟล์เสียงอ่านข่าวไทย"""
+def split_text_into_chunks(text, max_chars=1200):
+    """แบ่งข้อความเป็นก้อนย่อยๆ เพื่อป้องกัน Edge-TTS Timeout หรือปฏิเสธการประมวลผล"""
+    lines = text.splitlines()
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        while len(line) > max_chars:
+            cut_idx = line.rfind(' ', 0, max_chars)
+            if cut_idx == -1:
+                cut_idx = max_chars
+            part = line[:cut_idx].strip()
+            if part:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = []
+                    current_len = 0
+                chunks.append(part)
+            line = line[cut_idx:].strip()
+
+        if current_len + len(line) + 1 <= max_chars:
+            current_chunk.append(line)
+            current_len += len(line) + 1
+        else:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            current_chunk = [line]
+            current_len = len(line)
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks if chunks else [text]
+
+async def text_to_speech_thai(text, output_audio_path, max_retries=4):
+    """สร้างไฟล์เสียงอ่านข่าวไทย พร้อมแบ่งท่อนและ Retry ป้องกัน No audio was received"""
     print(f"  🗣️ [3/3] กำลังสร้างไฟล์เสียงอ่านข่าวไทย: {output_audio_path}...")
+    
+    # 1. ทำความสะอาดข้อความ ตัด Markdown
+    clean_text = text.replace('*', '').replace('#', '').strip()
+    if not clean_text:
+        print("  ⚠️ ข้อความว่างเปล่า ข้ามการแปลงเป็นเสียง")
+        return False
+
+    # 2. แบ่งข้อความเป็นช่วงย่อย ไม่ให้เกินขีดจำกัดของ Edge-TTS ต่อครั้ง
+    chunks = split_text_into_chunks(clean_text, max_chars=1200)
+    voice = "th-TH-PremwadeeNeural"
+    temp_output = output_audio_path + ".tmp"
+
     try:
-        voice = "th-TH-PremwadeeNeural"
-        tts = edge_tts.Communicate(text, voice)
-        await tts.save(output_audio_path)
+        with open(temp_output, "wb") as f_out:
+            for idx, chunk in enumerate(chunks, 1):
+                chunk_success = False
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        tts = edge_tts.Communicate(chunk, voice)
+                        audio_received = False
+                        
+                        async for message in tts.stream():
+                            if message["type"] == "audio":
+                                f_out.write(message["data"])
+                                audio_received = True
+
+                        if audio_received:
+                            chunk_success = True
+                            break
+                        else:
+                            raise RuntimeError("No audio received")
+
+                    except Exception as e:
+                        if attempt < max_retries:
+                            print(f"  ⚠️ Edge-TTS พบปัญหา (ท่อน {idx}/{len(chunks)} รอบ {attempt}): {e} กำลังลองใหม่...")
+                            await asyncio.sleep(attempt * 2)
+                        else:
+                            print(f"  ❌ สังเคราะห์เสียงล้มเหลวที่ท่อน {idx}/{len(chunks)}: {e}")
+
+                if not chunk_success:
+                    if os.path.exists(temp_output):
+                        os.remove(temp_output)
+                    return False
+
+        if os.path.exists(output_audio_path):
+            os.remove(output_audio_path)
+        os.rename(temp_output, output_audio_path)
         print(f"  ✅ บันทึกเสียงพากย์ไทยสำเร็จ!")
+        return True
+
     except Exception as e:
+        if os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except:
+                pass
         print(f"  ❌ สังเคราะห์เสียงอ่านข่าวล้มเหลว: {e}")
+        return False
 
 def process_single_file(seg_path, current_idx, total_files):
     print(f"==================================================")
@@ -147,9 +237,13 @@ def process_single_file(seg_path, current_idx, total_files):
     print(f"  💾 [2/3] บันทึกคำแปลข้อความ: {txt_filename}")
 
     tts_filename = seg_path.replace(".mp3", "_อ่านข่าวไทย.mp3")
-    asyncio.run(text_to_speech_thai(th_text, tts_filename))
-    print(f"🎉 เสร็จสิ้นขั้นตอนของไฟล์ [{current_idx}/{total_files}]\n")
+    success = asyncio.run(text_to_speech_thai(th_text, tts_filename))
     
+    if not success or not os.path.exists(tts_filename):
+        print(f"  ⏭️ ข้ามไฟล์ {os.path.basename(seg_path)} เนื่องจากสร้างไฟล์เสียงไม่สำเร็จ")
+        return None
+
+    print(f"🎉 เสร็จสิ้นขั้นตอนของไฟล์ [{current_idx}/{total_files}]\n")
     return tts_filename
 
 # --- 🛠️ ฟังก์ชันใหม่สำหรับต่อไฟล์เสียงแบบอเนกประสงค์ ---
