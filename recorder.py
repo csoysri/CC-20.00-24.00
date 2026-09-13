@@ -4,15 +4,16 @@ import glob
 import time
 import asyncio
 import edge_tts
-import shutil  # เพิ่ม import shutil สำหรับการย้าย/คัดลอกไฟล์
+import shutil
+import re  # เพิ่มการใช้งาน Regex จัดการชื่อโฟลเดอร์
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from google import genai
 
-TARGET_URL = "https://cdn-fr1-eu.lncoperations.ee/hls/cnbc_live/index.m3u8" 
+TARGET_URL = "https://cdn-fr1-eu.lncoperations.ee/hls/cnbc_live/index.m3u8"
 
 # 🛠️ ตั้งเวลา: อัด 3 ชั่วโมง (10800 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
-RECORD_DURATION = 14400
+RECORD_DURATION = 14400  
 SEGMENT_DURATION = 420
 
 # 🔑 ดึง Key จาก GitHub Secret อัตโนมัติ
@@ -41,7 +42,7 @@ def record_stream(output_filename, duration):
         '-vn',
         '-c:a', 'libmp3lame',
         '-b:a', '128k',
-        output_filename
+        os.path.abspath(output_filename) # บังคับใช้ Absolute Path
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -55,22 +56,19 @@ def split_audio(input_file, date_prefix, folder_name, segment_time=420):
     """ตัดแบ่งไฟล์เสียง .mp3 พร้อมจัดเรียง timestamp รอยต่อให้สะอาด"""
     print(f"\n✂️ กำลังตัดแบ่งไฟล์ '{input_file}' เป็นท่อนละ {segment_time} วินาที...")
     
-    # แก้ไขให้นำคำว่า part_ ขึ้นต้นชื่อไฟล์
     output_pattern = os.path.join(folder_name, f"part_{date_prefix}_%03d.mp3")
 
-    # เพิ่ม -avoid_negative_ts make_zero เพื่อป้องกันปัญหา Timestamp ติดลบ/สะดุดรอยต่อ
     cmd = [
         'ffmpeg', '-y',
-        '-i', input_file,
+        '-i', os.path.abspath(input_file),
         '-f', 'segment',
         '-segment_time', str(segment_time),
         '-avoid_negative_ts', 'make_zero',
         '-c', 'copy',
-        output_pattern
+        os.path.abspath(output_pattern) # บังคับใช้ Absolute Path
     ]
     subprocess.run(cmd, check=True)
     
-    # อัปเดตแพทเทิร์นค้นหาไฟล์ให้ตรงกับชื่อไฟล์ใหม่
     segments = sorted(glob.glob(os.path.join(folder_name, f"part_{date_prefix}_*.mp3")))
     print(f"🎉 ตัดไฟล์สำเร็จ! ได้ทั้งหมด {len(segments)} ไฟล์\n")
     return segments
@@ -107,7 +105,6 @@ def transcribe_and_translate(audio_path, max_retries=3):
             client.files.delete(name=audio_file.name)
             text_result = response.text.strip() if response.text else ""
             
-            # กรองท่อนที่ไม่มีเสียงพูดออก ไม่ต้องส่งไปสังเคราะห์เสียงอ่าน
             if "ไม่มีเสียงบรรยายข่าว" in text_result:
                 return None
                 
@@ -163,13 +160,11 @@ async def text_to_speech_thai(text, output_audio_path, max_retries=4):
     """สร้างไฟล์เสียงอ่านข่าวไทย พร้อมแบ่งท่อนและ Retry ป้องกัน No audio was received"""
     print(f"  🗣️ [3/3] กำลังสร้างไฟล์เสียงอ่านข่าวไทย: {output_audio_path}...")
     
-    # 1. ทำความสะอาดข้อความ ตัด Markdown
     clean_text = text.replace('*', '').replace('#', '').strip()
     if not clean_text:
         print("  ⚠️ ข้อความว่างเปล่า ข้ามการแปลงเป็นเสียง")
         return False
 
-    # 2. แบ่งข้อความเป็นช่วงย่อย ไม่ให้เกินขีดจำกัดของ Edge-TTS ต่อครั้ง
     chunks = split_text_into_chunks(clean_text, max_chars=1200)
     voice = "th-TH-PremwadeeNeural"
     temp_output = output_audio_path + ".tmp"
@@ -246,15 +241,16 @@ def process_single_file(seg_path, current_idx, total_files):
     print(f"🎉 เสร็จสิ้นขั้นตอนของไฟล์ [{current_idx}/{total_files}]\n")
     return tts_filename
 
-# --- 🛠️ ฟังก์ชันใหม่สำหรับต่อไฟล์เสียงแบบอเนกประสงค์ ---
+# --- 🛠️ ฟังก์ชันสำหรับต่อไฟล์เสียงแบบบังคับ Path ป้องกันปัญหาไฟล์ซ่อน ---
 def concat_audio_files(input_files, output_filename):
     """ฟังก์ชันย่อยสำหรับรวมไฟล์เสียงด้วย FFmpeg"""
     if len(input_files) == 1:
-        shutil.copy(input_files[0], output_filename)
+        shutil.copy(os.path.abspath(input_files[0]), os.path.abspath(output_filename))
         return True
 
     cmd = ['ffmpeg', '-y']
     for f in input_files:
+        # 🔑 บังคับให้ FFmpeg อ่านไฟล์จากที่อยู่จริง (Absolute Path) ป้องกันบั๊กใน Sub folder
         cmd.extend(['-i', os.path.abspath(f)])
 
     n = len(input_files)
@@ -269,17 +265,16 @@ def concat_audio_files(input_files, output_filename):
         '-ar', '44100',
         '-ac', '2',
         '-map_metadata', '-1',
-        output_filename
+        os.path.abspath(output_filename) # 🔑 บังคับ Output เป็น Absolute Path
     ])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"❌ Error merging files:\n{result.stderr}")
     return result.returncode == 0 and os.path.exists(output_filename)
 
 def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
-    """
-    รวมไฟล์เสียงอ่านข่าวโดยแบ่งทำทีละ 10 ไฟล์ 
-    เพื่อลดภาระของ FFmpeg และป้องกันบั๊กเมื่อรวมไฟล์จำนวนมากพร้อมกัน
-    """
+    """รวมไฟล์เสียงอ่านข่าวโดยแบ่งทำทีละ 10 ไฟล์"""
     print(f"==================================================")
     print(f"🔗 กำลังรวมไฟล์เสียงทั้งหมด {len(tts_files)} ไฟล์ (แบ่งทำทีละ 10 ไฟล์)...")
 
@@ -287,16 +282,14 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
         print("⚠️ ไม่มีไฟล์เสียงสำหรับรวม")
         return
 
-    # กรณีมีไฟล์เดียว
     if len(tts_files) == 1:
-        shutil.move(tts_files[0], final_output_filename)
+        shutil.move(os.path.abspath(tts_files[0]), os.path.abspath(final_output_filename))
         print(f"✅ มีเพียงไฟล์เดียว บันทึกสำเร็จ: {final_output_filename}")
         return
 
     batch_size = 10
     intermediate_files = []
 
-    # 1. แบ่งกลุ่มไฟล์ทีละ 10 ไฟล์
     for i in range(0, len(tts_files), batch_size):
         batch = tts_files[i:i + batch_size]
         batch_num = (i // batch_size) + 1
@@ -307,7 +300,6 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
 
         if success:
             intermediate_files.append(temp_output)
-            # ลบไฟล์ย่อยเฉพาะใน batch ที่รวมสำเร็จแล้ว
             for f in batch:
                 try:
                     os.remove(f)
@@ -316,7 +308,6 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
         else:
             print(f"  ❌ รวมกลุ่มที่ {batch_num} ล้มเหลว!")
 
-    # 2. นำไฟล์ชั่วคราว (temp_batch_X) มารวมกันเป็นไฟล์สุดท้าย
     if not intermediate_files:
         print("❌ ไม่สามารถสร้างไฟล์ชั่วคราวได้เลย ยกเลิกการรวมไฟล์")
         return
@@ -325,16 +316,13 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
     print(f"🔗 กำลังรวมไฟล์กลุ่มย่อยทั้งหมด {len(intermediate_files)} ไฟล์ เป็นไฟล์สุดท้าย...")
     
     if len(intermediate_files) == 1:
-        # ถ้ามีแค่ batch เดียว (ไฟล์ต้นทาง < 10) ก็แค่เปลี่ยนชื่อ
-        shutil.move(intermediate_files[0], final_output_filename)
+        shutil.move(os.path.abspath(intermediate_files[0]), os.path.abspath(final_output_filename))
         print(f"✅ รวมไฟล์สำเร็จสมบูรณ์: {final_output_filename}")
     else:
-        # ถ้าน้อยกว่าหรือเท่ากับ 10 batch รวมกันได้เลย
         final_success = concat_audio_files(intermediate_files, final_output_filename)
         
         if final_success:
             print(f"✅ รวมไฟล์สำเร็จสมบูรณ์: {final_output_filename}")
-            # ลบไฟล์ temp_batch ทิ้ง
             for f in intermediate_files:
                 try:
                     os.remove(f)
@@ -348,15 +336,21 @@ if __name__ == "__main__":
     th_time = datetime.now(ZoneInfo("Asia/Bangkok"))
     date_str = th_time.strftime('%Y%m%d_%H%M%S')
     
-    # 📁 1. ดึงชื่อไฟล์ yml จาก Github Actions (หากไม่มีจะใช้ค่า Default เป็น "CNBC_Workflow")
+    # 📁 1. ระบุชื่อโฟลเดอร์หลัก "CNBC"
+    base_dir = "CNBC"
+    
+    # 📁 2. ดึงชื่อไฟล์ yml จาก Github Actions (เช่น CC 20.00-24.00)
     yml_name = os.getenv("GITHUB_WORKFLOW", "CNBC_Workflow")
+    
+    # ลบอักขระพิเศษ (เช่น / \ : * ? " < > |) เพื่อป้องกันไม่ให้เผลอสร้างโฟลเดอร์ซ้อนกันแบบผิดปกติ
+    yml_name = re.sub(r'[\\/*?:"<>|]', "", yml_name) 
     yml_name = yml_name.replace(" ", "_")
     
-    # 📁 2. นำชื่อ yml มาต่อด้วย เวลา-นาที (HH-MM)
+    # 📁 3. นำชื่อ yml มาต่อด้วย เวลา-นาที (HH-MM)
     folder_time = th_time.strftime('%H-%M') 
-    folder_name = f"{yml_name}_{folder_time}"
     
-    # 📁 3. สร้างโฟลเดอร์
+    # 📁 4. สร้าง Path โฟลเดอร์เป้าหมาย (ซับโฟลเดอร์แค่ 1 ชั้น) -> CNBC/CC_20.00-24.00_HH-MM
+    folder_name = os.path.join(base_dir, f"{yml_name}_{folder_time}")
     os.makedirs(folder_name, exist_ok=True)
     print(f"📁 สร้างโฟลเดอร์สำหรับเก็บผลลัพธ์: {folder_name}\n")
 
