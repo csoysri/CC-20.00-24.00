@@ -1,18 +1,17 @@
 import os
 import subprocess
-import glob
 import time
 import asyncio
 import edge_tts
 import shutil
-import re  # เพิ่มการใช้งาน Regex จัดการชื่อโฟลเดอร์
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from google import genai
 
 TARGET_URL = "https://cdn-fr1-eu.lncoperations.ee/hls/cnbc_live/index.m3u8"
 
-# 🛠️ ตั้งเวลา: อัด 3 ชั่วโมง (10800 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
+# 🛠️ ตั้งเวลา: อัด 4 ชั่วโมง (14400 วินาที) / ตัดท่อนละ 7 นาที (420 วินาที)
 RECORD_DURATION = 14400  
 SEGMENT_DURATION = 420
 
@@ -56,7 +55,7 @@ def split_audio(input_file, date_prefix, folder_name, segment_time=420):
     """ตัดแบ่งไฟล์เสียง .mp3 พร้อมจัดเรียง timestamp รอยต่อให้สะอาด"""
     print(f"\n✂️ กำลังตัดแบ่งไฟล์ '{input_file}' เป็นท่อนละ {segment_time} วินาที...")
     
-    output_pattern = os.path.join(folder_name, f"part_{date_prefix}_%03d.mp3")
+    output_pattern = os.path.join(os.path.abspath(folder_name), f"part_{date_prefix}_%03d.mp3")
 
     cmd = [
         'ffmpeg', '-y',
@@ -65,11 +64,15 @@ def split_audio(input_file, date_prefix, folder_name, segment_time=420):
         '-segment_time', str(segment_time),
         '-avoid_negative_ts', 'make_zero',
         '-c', 'copy',
-        os.path.abspath(output_pattern) # บังคับใช้ Absolute Path
+        output_pattern
     ]
     subprocess.run(cmd, check=True)
     
-    segments = sorted(glob.glob(os.path.join(folder_name, f"part_{date_prefix}_*.mp3")))
+    # ใช้ os.listdir เพื่อความแน่นอนในการอ่านชื่อไฟล์ที่มีเว้นวรรคหรือสัญลักษณ์พิเศษ
+    segments = sorted([
+        os.path.join(folder_name, f) for f in os.listdir(folder_name)
+        if f.startswith(f"part_{date_prefix}_") and f.endswith(".mp3")
+    ])
     print(f"🎉 ตัดไฟล์สำเร็จ! ได้ทั้งหมด {len(segments)} ไฟล์\n")
     return segments
 
@@ -98,7 +101,7 @@ def transcribe_and_translate(audio_path, max_retries=3):
             """
 
             response = client.models.generate_content(
-                model='gemini-3.5-flash-lite',
+                model='gemini-2.5-flash-lite',
                 contents=[audio_file, prompt]
             )
 
@@ -118,7 +121,7 @@ def transcribe_and_translate(audio_path, max_retries=3):
                 return None
 
 def split_text_into_chunks(text, max_chars=1200):
-    """แบ่งข้อความเป็นก้อนย่อยๆ เพื่อป้องกัน Edge-TTS Timeout หรือปฏิเสธการประมวลผล"""
+    """แบ่งข้อความเป็นก้อนย่อยๆ เพื่อป้องกัน Edge-TTS Timeout"""
     lines = text.splitlines()
     chunks = []
     current_chunk = []
@@ -234,71 +237,125 @@ def process_single_file(seg_path, current_idx, total_files):
     tts_filename = seg_path.replace(".mp3", "_อ่านข่าวไทย.mp3")
     success = asyncio.run(text_to_speech_thai(th_text, tts_filename))
     
-    if not success or not os.path.exists(tts_filename):
+    if not success or not os.path.exists(tts_filename) or os.path.getsize(tts_filename) == 0:
         print(f"  ⏭️ ข้ามไฟล์ {os.path.basename(seg_path)} เนื่องจากสร้างไฟล์เสียงไม่สำเร็จ")
         return None
 
     print(f"🎉 เสร็จสิ้นขั้นตอนของไฟล์ [{current_idx}/{total_files}]\n")
     return tts_filename
 
-# --- 🛠️ ฟังก์ชันสำหรับต่อไฟล์เสียงแบบบังคับ Path ป้องกันปัญหาไฟล์ซ่อน ---
+# --- 🛠️ ฟังก์ชันต่อไฟล์เสียงแบบ Concat Demuxer ผสาน Filter Complex ทนทานทุกสภาพ Path ---
 def concat_audio_files(input_files, output_filename):
-    """ฟังก์ชันย่อยสำหรับรวมไฟล์เสียงด้วย FFmpeg"""
-    if len(input_files) == 1:
-        shutil.copy(os.path.abspath(input_files[0]), os.path.abspath(output_filename))
+    """รวมไฟล์เสียงด้วย Concat Demuxer พร้อมระบบสำรอง ป้องกันปัญหาใน Subfolder และชื่อไฟล์เว้นวรรค"""
+    valid_files = [os.path.abspath(f) for f in input_files if os.path.exists(f) and os.path.getsize(f) > 0]
+    
+    if not valid_files:
+        print("  ⚠️ ไม่มีไฟล์เสียงที่ถูกต้องสำหรับรวม")
+        return False
+
+    if len(valid_files) == 1:
+        shutil.copy(valid_files[0], os.path.abspath(output_filename))
         return True
 
-    cmd = ['ffmpeg', '-y']
-    for f in input_files:
-        # 🔑 บังคับให้ FFmpeg อ่านไฟล์จากที่อยู่จริง (Absolute Path) ป้องกันบั๊กใน Sub folder
-        cmd.extend(['-i', os.path.abspath(f)])
+    # 1. วิธีหลัก: Concat Demuxer ผ่าน List File ปลอดภัยต่อชื่อโฟลเดอร์และ Path ยาว
+    list_file = os.path.abspath(output_filename + ".txt")
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for audio_file in valid_files:
+                clean_path = audio_file.replace("'", "'\\''")
+                f.write(f"file '{clean_path}'\n")
 
-    n = len(input_files)
-    filter_inputs = "".join([f"[{i}:a]" for i in range(n)])
-    filter_str = f"{filter_inputs}concat=n={n}:v=0:a=1[outa]"
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c:a', 'libmp3lame',
+            '-b:a', '128k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-map_metadata', '-1',
+            os.path.abspath(output_filename)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except:
+                pass
 
-    cmd.extend([
-        '-filter_complex', filter_str,
-        '-map', '[outa]',
-        '-c:a', 'libmp3lame',
-        '-b:a', '128k',
-        '-ar', '44100',
-        '-ac', '2',
-        '-map_metadata', '-1',
-        os.path.abspath(output_filename) # 🔑 บังคับ Output เป็น Absolute Path
-    ])
+        if result.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > 0:
+            return True
+        else:
+            print(f"  ⚠️ Concat Demuxer ไม่สมบูรณ์ กำลังสลับไปใช้ Filter Complex...")
+    except Exception as e:
+        print(f"  ⚠️ Concat Demuxer Error: {e}")
+        if os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except:
+                pass
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"❌ Error merging files:\n{result.stderr}")
-    return result.returncode == 0 and os.path.exists(output_filename)
+    # 2. วิธีสำรอง: Filter Complex
+    try:
+        cmd = ['ffmpeg', '-y']
+        for f in valid_files:
+            cmd.extend(['-i', f])
+
+        n = len(valid_files)
+        filter_inputs = "".join([f"[{i}:a]" for i in range(n)])
+        filter_str = f"{filter_inputs}concat=n={n}:v=0:a=1[outa]"
+
+        cmd.extend([
+            '-filter_complex', filter_str,
+            '-map', '[outa]',
+            '-c:a', 'libmp3lame',
+            '-b:a', '128k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-map_metadata', '-1',
+            os.path.abspath(output_filename)
+        ])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > 0
+    except Exception as e:
+        print(f"❌ รวมไฟล์ล้มเหลว: {e}")
+        return False
 
 def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
     """รวมไฟล์เสียงอ่านข่าวโดยแบ่งทำทีละ 10 ไฟล์"""
-    print(f"==================================================")
-    print(f"🔗 กำลังรวมไฟล์เสียงทั้งหมด {len(tts_files)} ไฟล์ (แบ่งทำทีละ 10 ไฟล์)...")
+    valid_tts_files = [os.path.abspath(f) for f in tts_files if os.path.exists(f) and os.path.getsize(f) > 0]
 
-    if not tts_files:
+    print(f"==================================================")
+    print(f"🔗 กำลังรวมไฟล์เสียงทั้งหมด {len(valid_tts_files)} ไฟล์ (แบ่งทำทีละ 10 ไฟล์)...")
+
+    if not valid_tts_files:
         print("⚠️ ไม่มีไฟล์เสียงสำหรับรวม")
         return
 
-    if len(tts_files) == 1:
-        shutil.move(os.path.abspath(tts_files[0]), os.path.abspath(final_output_filename))
+    if len(valid_tts_files) == 1:
+        if os.path.exists(final_output_filename):
+            try:
+                os.remove(final_output_filename)
+            except:
+                pass
+        shutil.move(valid_tts_files[0], os.path.abspath(final_output_filename))
         print(f"✅ มีเพียงไฟล์เดียว บันทึกสำเร็จ: {final_output_filename}")
         return
 
     batch_size = 10
     intermediate_files = []
 
-    for i in range(0, len(tts_files), batch_size):
-        batch = tts_files[i:i + batch_size]
+    for i in range(0, len(valid_tts_files), batch_size):
+        batch = valid_tts_files[i:i + batch_size]
         batch_num = (i // batch_size) + 1
         temp_output = os.path.join(folder_name, f"temp_batch_{batch_num}.mp3")
 
         print(f"  ⏳ กำลังรวมกลุ่มที่ {batch_num} ({len(batch)} ไฟล์) -> {os.path.basename(temp_output)} ...")
         success = concat_audio_files(batch, temp_output)
 
-        if success:
+        if success and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
             intermediate_files.append(temp_output)
             for f in batch:
                 try:
@@ -316,6 +373,11 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
     print(f"🔗 กำลังรวมไฟล์กลุ่มย่อยทั้งหมด {len(intermediate_files)} ไฟล์ เป็นไฟล์สุดท้าย...")
     
     if len(intermediate_files) == 1:
+        if os.path.exists(final_output_filename):
+            try:
+                os.remove(final_output_filename)
+            except:
+                pass
         shutil.move(os.path.abspath(intermediate_files[0]), os.path.abspath(final_output_filename))
         print(f"✅ รวมไฟล์สำเร็จสมบูรณ์: {final_output_filename}")
     else:
@@ -336,23 +398,22 @@ if __name__ == "__main__":
     th_time = datetime.now(ZoneInfo("Asia/Bangkok"))
     date_str = th_time.strftime('%Y%m%d_%H%M%S')
     
-    # 📁 1. ระบุชื่อโฟลเดอร์หลัก "CNBC"
+    # 📁 1. กำหนดโฟลเดอร์หลัก "CNBC"
     base_dir = "CNBC"
+    os.makedirs(base_dir, exist_ok=True)
     
-    # 📁 2. ดึงชื่อไฟล์ yml จาก Github Actions (เช่น CC 20.00-24.00)
-    yml_name = os.getenv("GITHUB_WORKFLOW", "CNBC_Workflow")
+    # 📁 2. ดึงชื่อจาก workflow name เช่น "CC 20.00-24.00"
+    raw_name = os.getenv("GITHUB_WORKFLOW", "CC 20.00-24.00")
     
-    # ลบอักขระพิเศษ (เช่น / \ : * ? " < > |) เพื่อป้องกันไม่ให้เผลอสร้างโฟลเดอร์ซ้อนกันแบบผิดปกติ
-    yml_name = re.sub(r'[\\/*?:"<>|]', "", yml_name) 
-    yml_name = yml_name.replace(" ", "_")
+    # 📁 3. กรองเครื่องหมายต้องห้ามออก ป้องกันไม่ให้แตกโฟลเดอร์ซ้อน (เช่น \ หรือ /)
+    subfolder_name = re.sub(r'[\\/*?:"<>|]', "", raw_name).strip()
+    if not subfolder_name:
+        subfolder_name = "CC 20.00-24.00"
     
-    # 📁 3. นำชื่อ yml มาต่อด้วย เวลา-นาที (HH-MM)
-    folder_time = th_time.strftime('%H-%M') 
-    
-    # 📁 4. สร้าง Path โฟลเดอร์เป้าหมาย (ซับโฟลเดอร์แค่ 1 ชั้น) -> CNBC/CC_20.00-24.00_HH-MM
-    folder_name = os.path.join(base_dir, f"{yml_name}_{folder_time}")
+    # 📁 4. สร้าง Subfolder เพียง 1 ชั้น: เช่น CNBC/CC 20.00-24.00
+    folder_name = os.path.join(base_dir, subfolder_name)
     os.makedirs(folder_name, exist_ok=True)
-    print(f"📁 สร้างโฟลเดอร์สำหรับเก็บผลลัพธ์: {folder_name}\n")
+    print(f"📁 โฟลเดอร์จัดเก็บผลลัพธ์ (Subfolder 1 ชั้น): {folder_name}\n")
 
     main_file = os.path.join(folder_name, f"raw_cnbc_{date_str}.mp3")
 
@@ -367,7 +428,7 @@ if __name__ == "__main__":
 
         for idx, seg in enumerate(segment_files, start=1):
             tts_file = process_single_file(seg, idx, total_segments)
-            if tts_file and os.path.exists(tts_file):
+            if tts_file and os.path.exists(tts_file) and os.path.getsize(tts_file) > 0:
                 generated_tts_files.append(tts_file)
             time.sleep(2)
 
@@ -377,6 +438,8 @@ if __name__ == "__main__":
         if generated_tts_files:
             final_audio = os.path.join(folder_name, f"final_thai_news_{date_str}.mp3")
             merge_and_cleanup_tts(generated_tts_files, final_audio, folder_name)
+        else:
+            print("⚠️ ไม่พบไฟล์อ่านข่าวที่สมบูรณ์สำหรับรวม")
             
     else:
         print("❌ การบันทึกเสียงล้มเหลว")
