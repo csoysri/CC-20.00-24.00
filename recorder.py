@@ -324,7 +324,7 @@ def concat_audio_files(input_files, output_filename):
         return False
 
 def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
-    """รวมไฟล์เสียงอ่านข่าวโดยแบ่งทำทีละ 10 ไฟล์"""
+    """รวมไฟล์เสียงอ่านข่าวโดยแบ่งทำทีละ 10 ไฟล์ โดยคงไฟล์เสียงอ่านข่าวไทยย่อยไว้ทั้งหมด (ลบเฉพาะไฟล์ temp_batch ชั่วคราว)"""
     valid_tts_files = [os.path.abspath(f) for f in tts_files if os.path.exists(f) and os.path.getsize(f) > 0]
 
     print(f"==================================================")
@@ -334,14 +334,15 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
         print("⚠️ ไม่มีไฟล์เสียงสำหรับรวม")
         return
 
+    # ถ้ามีเพียงไฟล์เดียว ให้คัดลอก (copy) ไปเป็นไฟล์สุดท้าย เพื่อคงไฟล์เดิมไว้
     if len(valid_tts_files) == 1:
         if os.path.exists(final_output_filename):
             try:
                 os.remove(final_output_filename)
             except:
                 pass
-        shutil.move(valid_tts_files[0], os.path.abspath(final_output_filename))
-        print(f"✅ มีเพียงไฟล์เดียว บันทึกสำเร็จ: {final_output_filename}")
+        shutil.copy(valid_tts_files[0], os.path.abspath(final_output_filename))
+        print(f"✅ มีเพียงไฟล์เดียว คัดลอกบันทึกสำเร็จ: {final_output_filename}")
         return
 
     batch_size = 10
@@ -357,11 +358,7 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
 
         if success and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
             intermediate_files.append(temp_output)
-            for f in batch:
-                try:
-                    os.remove(f)
-                except Exception as e:
-                    pass
+            # หมายเหตุ: นำคำสั่ง os.remove(f) ออกแล้ว เพื่อคงไฟล์เสียงอ่านข่าวไทยย่อยไว้ครบถ้วน
         else:
             print(f"  ❌ รวมกลุ่มที่ {batch_num} ล้มเหลว!")
 
@@ -388,7 +385,7 @@ def merge_and_cleanup_tts(tts_files, final_output_filename, folder_name):
             for f in intermediate_files:
                 try:
                     os.remove(f)
-                    print(f"  🗑️ ลบไฟล์กลุ่มย่อย: {os.path.basename(f)}")
+                    print(f"  🗑️ ลบไฟล์ชั่วคราว: {os.path.basename(f)}")
                 except:
                     pass
         else:
@@ -434,7 +431,7 @@ if __name__ == "__main__":
 
         print("✨ ประมวลผลและแปลครบทุกไฟล์เรียบร้อยแล้ว!")
         
-        # ดำเนินการรวมไฟล์เสียงอ่านข่าวทั้งหมดและลบไฟล์ย่อย
+        # รวมไฟล์อ่านข่าวเข้าด้วยกันเป็นไฟล์ final_thai_news โดยยังคงไฟล์ _อ่านข่าวไทย.mp3 ไว้
         if generated_tts_files:
             final_audio = os.path.join(folder_name, f"final_thai_news_{date_str}.mp3")
             merge_and_cleanup_tts(generated_tts_files, final_audio, folder_name)
